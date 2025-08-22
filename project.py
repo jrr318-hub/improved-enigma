@@ -179,6 +179,64 @@ def pick_best_primary_doc(session: requests.Session, cik: int, accession: str, d
         return default_primary
 
 
+def enumerate_candidate_docs(session: requests.Session, cik: int, accession: str, primary: str) -> List[str]:
+    """Return a prioritized list of candidate document filenames to scan within a filing.
+    Includes HTML, TXT, and PDF documents, de-duplicated and ordered by likelihood.
+    """
+    docnames: List[str] = []
+    seen = set()
+    try:
+        idx_url = filing_index_url(cik, accession)
+        r = session.get(idx_url, timeout=60)
+        r.raise_for_status()
+        html = r.text
+        rows = re.findall(r"<tr[\s\S]*?</tr>", html, flags=re.IGNORECASE)
+        for row in rows:
+            mf = re.search(r"href=\"[^\"]*/(.*?)\"", row, flags=re.IGNORECASE)
+            if not mf: continue
+            fname = mf.group(1)
+            if fname in seen: continue
+            ext = fname.lower().rsplit(".", 1)[-1] if "." in fname else ""
+            if ext in ("htm", "html", "txt", "pdf"):
+                seen.add(fname); docnames.append(fname)
+    except Exception:
+        pass
+    # Ensure primary is included and at front
+    if primary and primary not in seen:
+        docnames.insert(0, primary)
+    # Prioritize: HTML -> TXT -> PDF
+    def priority(n: str) -> int:
+        nlow = n.lower()
+        if nlow.endswith((".htm", ".html")): return 3
+        if nlow.endswith(".txt"): return 2
+        if nlow.endswith(".pdf"): return 1
+        return 0
+    docnames.sort(key=priority, reverse=True)
+    return docnames
+
+
+def get_text_from_document(session: requests.Session, url: str) -> Optional[str]:
+    """Fetch a document and return plain text. Supports HTML/TXT natively and tries PDF if available."""
+    r = session.get(url, timeout=60)
+    r.raise_for_status()
+    content_type = (r.headers.get("Content-Type") or "").lower()
+    r.encoding = r.apparent_encoding or "utf-8"
+    if any(ext in url.lower() for ext in (".htm", ".html")) or "html" in content_type:
+        return clean_html(r.text)
+    if url.lower().endswith(".txt") or "text/plain" in content_type:
+        return re.sub(r"\s+", " ", r.text)
+    if url.lower().endswith(".pdf") or "application/pdf" in content_type:
+        try:
+            # Lazy import to avoid hard dep
+            from pdfminer.high_level import extract_text as pdf_extract_text
+            text = pdf_extract_text(io.BytesIO(r.content))
+            return re.sub(r"\s+", " ", text)
+        except Exception:
+            return None
+    # Unknown type
+    return None
+
+
 def clean_html(text: str) -> str:
     text = TAG_STRIPPER.sub(" ", text); return re.sub(r"\s+", " ", text)
 
@@ -524,12 +582,26 @@ def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_full_hist
         chosen_doc = pick_best_primary_doc(s, cik, acc, primary)
         url = filing_doc_url(cik, acc, chosen_doc)
         try:
-            resp = s.get(url, timeout=60); resp.raise_for_status(); resp.encoding = resp.apparent_encoding or "utf-8"
-            text = clean_html(resp.text)
-            sections = extract_all_item_502_sections(text)
-            if not sections:
+            # Enumerate all candidate documents in this filing and scan each
+            docs = enumerate_candidate_docs(s, cik, acc, chosen_doc)
+            sections_all: List[str] = []
+            for fname in docs:
+                doc_url = filing_doc_url(cik, acc, fname)
+                try:
+                    text = get_text_from_document(s, doc_url)
+                except Exception:
+                    text = None
+                if not text:
+                    continue
+                sections = extract_all_item_502_sections(text)
+                if sections:
+                    sections_all.extend(sections)
+                # Early exit if we already found sections in an HTML/TXT doc
+                if sections_all and (fname.lower().endswith((".htm", ".html", ".txt"))):
+                    break
+            if not sections_all:
                 time.sleep(delay_s); continue
-            joined = "\n\n---\n\n".join(sections)
+            joined = "\n\n---\n\n".join(sections_all)
             if use_gemini:
                 events = extract_ceo_departures_gemini(joined, api_key, model_name)
             else:
