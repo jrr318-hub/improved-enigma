@@ -551,7 +551,7 @@ def parse_company_inputs(upload: Optional[io.BytesIO], manual_text: str, ua: str
 # Scanning
 # --------------------
 
-def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_full_history_flag: bool, use_gemini: bool, api_key: str, model_name: str) -> List[Dict[str, str]]:
+def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_full_history_flag: bool, use_gemini: bool, api_key: str, model_name: str) -> (List[Dict[str, str]], List[str]):
     try:
         js = fetch_submissions(cik, ua)
         company = js.get("name", "")
@@ -560,6 +560,7 @@ def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_full_hist
 
     s = requests.Session(); s.headers.update(ARCHIVE_HEADERS(ua))
     out: List[Dict[str, str]] = []
+    found_502_docs: List[str] = []
 
     if use_full_history_flag:
         filings = fetch_extended_history(cik, ua)
@@ -583,6 +584,7 @@ def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_full_hist
             # Enumerate all candidate documents in this filing and scan each
             docs = enumerate_candidate_docs(s, cik, acc, chosen_doc)
             sections_all: List[str] = []
+            first_event_doc_url: Optional[str] = None
             for fname in docs:
                 doc_url = filing_doc_url(cik, acc, fname)
                 try:
@@ -594,9 +596,9 @@ def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_full_hist
                 sections = extract_all_item_502_sections(text)
                 if sections:
                     sections_all.extend(sections)
-                # Early exit if we already found sections in an HTML/TXT doc
-                if sections_all and (fname.lower().endswith((".htm", ".html", ".txt"))):
-                    break
+                    found_502_docs.append(doc_url)
+                    if first_event_doc_url is None:
+                        first_event_doc_url = doc_url
             if not sections_all:
                 time.sleep(delay_s); continue
             joined = "\n\n---\n\n".join(sections_all)
@@ -617,7 +619,7 @@ def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_full_hist
                     "context": ev.get("phrase", ""),
                     "effective_date": ev.get("date", ""),
                     "confidence": ev.get("confidence", 0.6),
-                    "documentUrl": url,
+                    "documentUrl": first_event_doc_url or url,
                     "filingDetailUrl": filing_index_url(cik, acc),
                 })
         except Exception as e:
@@ -635,7 +637,7 @@ def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_full_hist
                 "filingDetailUrl": filing_index_url(cik, acc),
             })
         time.sleep(delay_s)
-    return out
+    return out, sorted(list(set(found_502_docs)))
 
 # --------------------
 # Run
@@ -665,11 +667,14 @@ if run_btn:
         cik_to_ticker = {}
 
     delay = 1.0 / max(rps, 0.2)
+    cik_to_docs: Dict[int, set] = {}
     for i, cik in enumerate(ciks, start=1):
         prev_n = len(rows)
         with st.spinner(f"Scanning CIK {int(cik):010d} for CEO departures"):
-            new_rows = scan_cik_for_ceo_departures(cik, ua, delay, use_full_history, use_gemini, gemini_key, gemini_model)
+            new_rows, doc_urls = scan_cik_for_ceo_departures(cik, ua, delay, use_full_history, use_gemini, gemini_key, gemini_model)
             rows += new_rows
+            if doc_urls:
+                cik_to_docs.setdefault(int(cik), set()).update(doc_urls)
         # Log per-ticker completion
         label = cik_to_ticker.get(int(cik)) or fetch_company_name(cik, ua) or f"CIK {int(cik):010d}"
         num_new = len(rows) - prev_n
@@ -697,7 +702,9 @@ if run_btn:
 
     if not rows:
         st.warning("No CEO departures detected in Item 5.02 for the selected companies/date range.")
-        st.stop()
+        # still show summary of Item 5.02 links if any
+        if not cik_to_docs:
+            st.stop()
 
     df = pd.DataFrame(rows)
 
@@ -720,4 +727,41 @@ if run_btn:
     csv = df[["company","cik","filingDate","ceo_name","effective_date","confidence","documentUrl","filingDetailUrl"]].to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Download CSV", data=csv, file_name="ceo_departures_item_5_02.csv", mime="text/csv")
 
-    st.info("Only CEO departures are shown. Director-only changes and other officers are intentionally excluded. If Gemini is unavailable, a strict heuristic with confidence scoring is used.")
+    # Build company summary with all Item 5.02 links
+    st.markdown("### 3) Summary by company (all Item 5.02 links)")
+    summary_rows: List[Dict[str, str]] = []
+    for cik in ciks:
+        c = int(cik)
+        ticker = cik_to_ticker.get(c, "")
+        # derive company from first matching row or fetch
+        comp = next((r["company"] for r in rows if int(r["cik"]) == c), fetch_company_name(c, ua))
+        # departure and names
+        has_departure = any((int(r["cik"]) == c and r.get("departing")) for r in rows)
+        names = sorted(set(r.get("ceo_name", "") for r in rows if int(r["cik"]) == c and r.get("departing") and r.get("ceo_name")))
+        links = sorted(list(cik_to_docs.get(c, set())))
+        summary_rows.append({
+            "ticker": ticker,
+            "company": comp,
+            "ceo_departure": "Yes" if has_departure else "No",
+            "ceo_name": ", ".join(names),
+            "num_item_5_02_docs": str(len(links)),
+            "item_5_02_links": " | ".join(links),
+        })
+    if summary_rows:
+        df_sum = pd.DataFrame(summary_rows)
+        st.dataframe(
+            df_sum.sort_values(["ticker"], na_position="last"),
+            use_container_width=True,
+            height=400,
+            column_config={
+                "ticker": st.column_config.TextColumn(label="Ticker"),
+                "company": st.column_config.TextColumn(label="Company"),
+                "ceo_departure": st.column_config.TextColumn(label="CEO Departure"),
+                "ceo_name": st.column_config.TextColumn(label="CEO Leaving"),
+                "num_item_5_02_docs": st.column_config.NumberColumn(label="# Item 5.02 Docs"),
+                "item_5_02_links": st.column_config.TextColumn(label="Item 5.02 Links"),
+            }
+        )
+        sum_csv = df_sum.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download Summary CSV", data=sum_csv, file_name="item_5_02_summary.csv", mime="text/csv")
+    st.info("Summary shows all Item 5.02 document links per company for the selected dates.")
