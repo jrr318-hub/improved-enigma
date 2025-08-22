@@ -60,6 +60,10 @@ run_btn = st.button("🚀 Run search")
 SEC_HEADERS = lambda ua: {"User-Agent": ua.strip(), "Accept-Encoding": "gzip, deflate", "Host": "data.sec.gov"}
 ARCHIVE_HEADERS = lambda ua: {"User-Agent": ua.strip(), "Accept-Encoding": "gzip, deflate", "Host": "www.sec.gov"}
 
+# warn-once flags
+SDK_WARNED = False
+REST_WARNED = False
+
 ITEM_502_REGEX = re.compile(r"item[\s\xa0]*5\.02", re.IGNORECASE)
 TAG_STRIPPER = re.compile(r"<[^>]+>")
 
@@ -133,10 +137,53 @@ def filing_doc_url(cik: int, accession: str, primary_doc: str) -> str:
     return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}/{primary_doc}"
 
 
+def filing_index_url(cik: int, accession: str) -> str:
+    return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}-index.html"
+
+
+def pick_best_primary_doc(session: requests.Session, cik: int, accession: str, default_primary: str) -> str:
+    """Use the filing index page to choose the main 8-K HTML document when possible."""
+    try:
+        idx_url = filing_index_url(cik, accession)
+        r = session.get(idx_url, timeout=60)
+        r.raise_for_status()
+        html = r.text
+        # Rough-parse rows: grab tuples of (href, type)
+        # Match links like <a href="/Archives/edgar/data/CIK/ACC/file.htm"> and nearby Type cell
+        rows = re.findall(r"<tr[\s\S]*?</tr>", html, flags=re.IGNORECASE)
+        candidates: List[tuple] = []
+        for row in rows:
+            # document file
+            mfile = re.search(r"href=\"[^\"]*/(.*?)\"", row, flags=re.IGNORECASE)
+            mtype = re.search(r"<td[^>]*>\s*([A-Za-z0-9\- ]*8\-K[^<]*)\s*</td>", row, flags=re.IGNORECASE)
+            if not mfile:
+                continue
+            fname = mfile.group(1)
+            # find document type column; if not explicitly 8-K, also accept description mentioning 8-K
+            is_html = fname.lower().endswith((".htm", ".html"))
+            score = 0
+            if is_html:
+                score += 1
+            if mtype:
+                score += 2
+            # Avoid exhibits (ex99) unless nothing else
+            if re.search(r"ex-?\d|ex99|exhibit", fname, re.IGNORECASE):
+                score -= 2
+            candidates.append((score, fname))
+        if candidates:
+            candidates.sort(reverse=True)
+            best = candidates[0][1]
+            return best
+        return default_primary
+    except Exception:
+        return default_primary
+
+
 def clean_html(text: str) -> str:
     text = TAG_STRIPPER.sub(" ", text); return re.sub(r"\s+", " ", text)
 
 
+# Maintain the legacy short-window finder for quick checks
 def find_item_502(text: str) -> Optional[str]:
     m = ITEM_502_REGEX.search(text)
     if not m: return None
@@ -157,6 +204,27 @@ def extract_item_502_section(text: str) -> Optional[str]:
     section = text[start:end]
     return section.strip()
 
+
+def extract_all_item_502_sections(text: str) -> List[str]:
+    """Extract all Item 5.02 sections from the filing text."""
+    sections: List[str] = []
+    next_item_re = re.compile(r"item[\s\xa0]*\d+\.\d+", re.IGNORECASE)
+    for m in ITEM_502_REGEX.finditer(text):
+        start = m.start()
+        next_m = next_item_re.search(text, m.end())
+        end = next_m.start() if next_m else len(text)
+        section = text[start:end].strip()
+        if 200 <= len(section) <= 200_000:
+            sections.append(section)
+    # Deduplicate near-duplicates
+    uniq: List[str] = []
+    seen = set()
+    for sct in sections:
+        key = sct[:400]
+        if key in seen: continue
+        seen.add(key); uniq.append(sct)
+    return uniq
+
 # --------------------
 # Heuristic fallback (strict)
 # --------------------
@@ -164,7 +232,7 @@ def extract_item_502_section(text: str) -> Optional[str]:
 def extract_ceo_departures_heuristic(text: str) -> List[Dict[str, str]]:
     events: List[Dict[str, str]] = []
     sentences = re.split(r"(?<=[\.!?])\s+", text)
-    for sent in sentences:
+    for idx, sent in enumerate(sentences):
         if len(sent) < 20: continue
         if not CEO_TOKEN.search(sent): continue
         if NEG_CONTINUE.search(sent): continue  # e.g., "will continue as CEO"
@@ -178,8 +246,19 @@ def extract_ceo_departures_heuristic(text: str) -> List[Dict[str, str]]:
         if not name:
             n = NAME_RE.search(sent); name = n.group(1) if n else None
         if not name: continue
+        # look for effective date in this or adjacent sentences
         d = DATE_RE.search(sent)
-        ev = {"name": name, "phrase": sent.strip()[:300]}
+        if not d:
+            look_window = " ".join(sentences[max(0, idx-1): min(len(sentences), idx+2)])
+            d = DATE_RE.search(look_window)
+        evidence = sent.strip()
+        confidence = 0.6
+        if d: confidence += 0.2
+        if re.search(r"effective|effective immediately|effective on", evidence, re.IGNORECASE):
+            confidence += 0.1
+        if "CEO" in evidence or re.search(r"Chief Executive Officer", evidence, re.IGNORECASE):
+            confidence += 0.05
+        ev = {"name": name, "phrase": evidence[:300], "confidence": round(min(confidence, 0.95), 2)}
         if d: ev["date"] = d.group(0)
         events.append(ev)
     return events
@@ -189,21 +268,26 @@ def extract_ceo_departures_heuristic(text: str) -> List[Dict[str, str]]:
 # --------------------
 
 def extract_ceo_departures_gemini(text: str, api_key: str, model_name: str) -> List[Dict[str, str]]:
+    global SDK_WARNED, REST_WARNED
     try:
         import google.generativeai as genai
     except Exception:
-        st.warning("`google-generativeai` not installed. Falling back to heuristic.")
+        if not SDK_WARNED:
+            st.warning("`google-generativeai` not installed. Falling back to heuristic.")
+            SDK_WARNED = True
         return extract_ceo_departures_heuristic(text)
 
     if not api_key:
-        st.warning("No Gemini API key provided — using heuristic only.")
+        if not SDK_WARNED:
+            st.warning("No Gemini API key provided — using heuristic only.")
+            SDK_WARNED = True
         return extract_ceo_departures_heuristic(text)
 
     genai.configure(api_key=api_key)
 
-    # Prefer the Item 5.02 section strictly
-    section = extract_item_502_section(text)
-    narrowed = section if section else text
+    # Prefer all Item 5.02 sections
+    sections = extract_all_item_502_sections(text)
+    narrowed = "\n\n---\n\n".join(sections) if sections else text
 
     # Focus the context to likely paragraphs to reduce cost and increase accuracy
     paras = [p for p in re.split(r"\n\s*\n", narrowed) if ("CEO" in p or "Chief Executive Officer" in p or "chief executive officer" in p)]
@@ -240,7 +324,7 @@ def extract_ceo_departures_gemini(text: str, api_key: str, model_name: str) -> L
     # Compatibility: support environments without GenerativeModel or structured outputs
     prompt_parts = [
         {"role": "user", "parts": [
-            "Extract CEO departures only from this 8-K text (Item 5.02):\n\n",
+            "Return JSON only with an 'events' array. \n\nExtract CEO departures only from this 8-K (Item 5.02):\n\n",
             context
         ]}
     ]
@@ -282,13 +366,13 @@ def extract_ceo_departures_gemini(text: str, api_key: str, model_name: str) -> L
         try:
             endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
             payload = {
-                "systemInstruction": {"role": "system", "parts": [{"text": system}]},
                 "contents": [
                     {
                         "role": "user",
                         "parts": [
-                            {"text": "Return a strict JSON object with an 'events' array. No prose."},
-                            {"text": "Extract CEO departures only from this 8-K text (Item 5.02):\n\n" + context},
+                            {"text": system},
+                            {"text": "\nReturn a strict JSON object with an 'events' array. No prose."},
+                            {"text": "\n\nExtract CEO departures only from this 8-K text (Item 5.02):\n\n" + context},
                         ],
                     }
                 ],
@@ -306,7 +390,6 @@ def extract_ceo_departures_gemini(text: str, api_key: str, model_name: str) -> L
             )
             r.raise_for_status()
             js = r.json()
-            # Extract text from candidates
             candidates = js.get("candidates", []) or []
             for c in candidates:
                 content = c.get("content") or {}
@@ -316,25 +399,27 @@ def extract_ceo_departures_gemini(text: str, api_key: str, model_name: str) -> L
                     raw_text = "\n".join(texts)
                     break
             if not raw_text:
-                # Some responses nest text differently
                 raw_text = js.get("text", "") or ""
             if not raw_text:
+                if not REST_WARNED:
+                    st.warning("Gemini REST call failed; using heuristic extractor.")
+                    REST_WARNED = True
                 return extract_ceo_departures_heuristic(context)
         except Exception:
-            st.warning("Gemini REST call failed; using heuristic extractor.")
+            if not REST_WARNED:
+                st.warning("Gemini REST call failed; using heuristic extractor.")
+                REST_WARNED = True
             return extract_ceo_departures_heuristic(context)
 
     # Parse JSON response (best effort), otherwise fallback to heuristic
     try:
         data = json.loads(raw_text)
     except Exception:
-        # Try to extract a JSON block if the model wrapped it
         try:
             fenced = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", raw_text)
             if fenced:
                 data = json.loads(fenced.group(1))
             else:
-                # last resort: take substring between first { and last }
                 first = raw_text.find("{"); last = raw_text.rfind("}")
                 if first != -1 and last != -1 and last > first:
                     data = json.loads(raw_text[first:last+1])
@@ -353,25 +438,31 @@ def extract_ceo_departures_gemini(text: str, api_key: str, model_name: str) -> L
         name = (e.get("person") or "").strip()
         if not name:
             continue
-        # reject if the evidence reads like an incoming appointment
         evidence_text = (e.get("evidence") or "")
         if NEG_INCOMING.search(evidence_text):
             continue
-        pat = re.compile(rf"(.{{0,120}})(?:CEO|Chief Executive Officer|principal executive officer)(.{{0,120}}{re.escape(name)}.{{0,120}})", re.IGNORECASE)
+        pat = re.compile(rf"(.{{0,160}})(?:CEO|Chief Executive Officer|principal executive officer)(.{{0,160}}{re.escape(name)}.{{0,160}})", re.IGNORECASE)
         if pat.search(context):
+            confidence = 0.7
+            if e.get("effective_date"): confidence += 0.2
+            if re.search(r"effective|effective immediately|effective on", evidence_text, re.IGNORECASE): confidence += 0.05
             checked.append({
                 "name": name,
                 "phrase": evidence_text[:300],
                 "date": (e.get("effective_date") or "").strip(),
+                "confidence": round(min(confidence, 0.98), 2),
             })
         else:
-            # fallback sentence check
             for sent in re.split(r"(?<=[\.!?])\s+", context):
                 if name in sent and CEO_TOKEN.search(sent) and DEPARTURE_VERBS.search(sent) and not NEG_INCOMING.search(sent):
+                    confidence = 0.65
+                    if e.get("effective_date"): confidence += 0.2
+                    if re.search(r"effective|effective immediately|effective on", sent, re.IGNORECASE): confidence += 0.05
                     checked.append({
                         "name": name,
                         "phrase": (e.get("evidence") or sent)[:300],
                         "date": (e.get("effective_date") or "").strip(),
+                        "confidence": round(min(confidence, 0.95), 2),
                     })
                     break
     return checked
@@ -429,17 +520,20 @@ def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_full_hist
         if start_date and fdate and fdate < start_date.strftime("%Y-%m-%d"): continue
         if end_date and fdate and fdate > end_date.strftime("%Y-%m-%d"): continue
 
-        url = filing_doc_url(cik, acc, primary)
+        # Use filing index to pick the main document when possible
+        chosen_doc = pick_best_primary_doc(s, cik, acc, primary)
+        url = filing_doc_url(cik, acc, chosen_doc)
         try:
             resp = s.get(url, timeout=60); resp.raise_for_status(); resp.encoding = resp.apparent_encoding or "utf-8"
             text = clean_html(resp.text)
-            section = extract_item_502_section(text)
-            if not section:
+            sections = extract_all_item_502_sections(text)
+            if not sections:
                 time.sleep(delay_s); continue
+            joined = "\n\n---\n\n".join(sections)
             if use_gemini:
-                events = extract_ceo_departures_gemini(section, api_key, model_name)
+                events = extract_ceo_departures_gemini(joined, api_key, model_name)
             else:
-                events = extract_ceo_departures_heuristic(section)
+                events = extract_ceo_departures_heuristic(joined)
             if not events:
                 time.sleep(delay_s); continue
             for ev in events:
@@ -449,11 +543,12 @@ def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_full_hist
                     "filingDate": fdate,
                     "accessionNumber": acc,
                     "ceo_name": ev.get("name", ""),
-                    "departing": True,  # departures only
+                    "departing": True,
                     "context": ev.get("phrase", ""),
                     "effective_date": ev.get("date", ""),
+                    "confidence": ev.get("confidence", 0.6),
                     "documentUrl": url,
-                    "filingDetailUrl": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc.replace('-', '')}-index.html",
+                    "filingDetailUrl": filing_index_url(cik, acc),
                 })
         except Exception as e:
             out.append({
@@ -465,8 +560,9 @@ def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_full_hist
                 "departing": False,
                 "context": f"ERROR: {e}",
                 "effective_date": "",
+                "confidence": 0.0,
                 "documentUrl": url,
-                "filingDetailUrl": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{(acc or '').replace('-', '')}-index.html",
+                "filingDetailUrl": filing_index_url(cik, acc),
             })
         time.sleep(delay_s)
     return out
@@ -511,11 +607,12 @@ if run_btn:
             "departing": st.column_config.CheckboxColumn(label="Departing"),
             "ceo_name": st.column_config.TextColumn(label="CEO Name"),
             "effective_date": st.column_config.TextColumn(label="Effective Date"),
+            "confidence": st.column_config.NumberColumn(label="Confidence", help="0-1 score", format="%0.2f"),
             "context": st.column_config.TextColumn(label="Context (snippet)", width="medium"),
         }
     )
 
-    csv = df[["company","cik","filingDate","ceo_name","effective_date","documentUrl","filingDetailUrl"]].to_csv(index=False).encode("utf-8")
+    csv = df[["company","cik","filingDate","ceo_name","effective_date","confidence","documentUrl","filingDetailUrl"]].to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Download CSV", data=csv, file_name="ceo_departures_item_5_02.csv", mime="text/csv")
 
-    st.info("Only CEO departures are shown. Director-only changes and other officers are intentionally excluded. If no API key is set, a strict heuristic is used.")
+    st.info("Only CEO departures are shown. Director-only changes and other officers are intentionally excluded. If Gemini is unavailable, a strict heuristic with confidence scoring is used.")
