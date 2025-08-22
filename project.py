@@ -278,8 +278,51 @@ def extract_ceo_departures_gemini(text: str, api_key: str, model_name: str) -> L
             )
             raw_text = getattr(resp, "text", "") or ""
     except AttributeError:
-        st.warning("Your google-generativeai package version is missing GenerativeModel. Upgrade with: pip install -U google-generativeai")
-        return extract_ceo_departures_heuristic(context)
+        # REST fallback to Generative Language API
+        try:
+            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+            payload = {
+                "systemInstruction": {"role": "system", "parts": [{"text": system}]},
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"text": "Return a strict JSON object with an 'events' array. No prose."},
+                            {"text": "Extract CEO departures only from this 8-K text (Item 5.02):\n\n" + context},
+                        ],
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "maxOutputTokens": 800,
+                },
+            }
+            r = requests.post(
+                endpoint,
+                params={"key": api_key},
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(payload),
+                timeout=60,
+            )
+            r.raise_for_status()
+            js = r.json()
+            # Extract text from candidates
+            candidates = js.get("candidates", []) or []
+            for c in candidates:
+                content = c.get("content") or {}
+                parts = content.get("parts") or []
+                texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
+                if texts:
+                    raw_text = "\n".join(texts)
+                    break
+            if not raw_text:
+                # Some responses nest text differently
+                raw_text = js.get("text", "") or ""
+            if not raw_text:
+                return extract_ceo_departures_heuristic(context)
+        except Exception:
+            st.warning("Gemini REST call failed; using heuristic extractor.")
+            return extract_ceo_departures_heuristic(context)
 
     # Parse JSON response (best effort), otherwise fallback to heuristic
     try:
