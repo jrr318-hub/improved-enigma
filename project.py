@@ -69,13 +69,13 @@ TAG_STRIPPER = re.compile(r"<[^>]+>")
 
 CEO_TOKEN = re.compile(r"\b(Chief Executive Officer|C\.?.?E\.?.?O\.?.?|CEO|principal executive officer)\b", re.IGNORECASE)
 DEPARTURE_VERBS = re.compile(
-    r"(resign(?:s|ed|ation)?|retir(?:e|es|ed|ement)|terminate(?:s|d|ion)?|ceased to serve|remov(?:e|ed)|dismiss(?:al|ed)|separate(?:s|d|ion)?|stepp?ed down|step(?:s)? down|will step down|to step down|will not stand for re-election|depart(?:s|ed|ure)?|leave(?:s|ing|t)|transition(?:s|ed)? out|end(?:ed)? employment|employment terminated)",
+    r"(resign(?:s|ed|ation)?|retir(?:e|es|ed|ement)|terminate(?:s|d|ion)?|ceased to serve|remov(?:e|ed)|dismiss(?:al|ed)|separate(?:s|d|ion)?|stepp?ed down|step(?:s)? down|will step down|to step down|will not stand for re-election|depart(?:s|ed|ure)?|leave(?:s|ing|t)|transition(?:s|ed)? out|end(?:ed)? employment|employment terminated|will no longer serve as|is no longer (?:the )?CEO)",
     re.IGNORECASE,
 )
 NEG_CONTINUE = re.compile(r"\b(continue|remains?|remain|retains?)\b", re.IGNORECASE)
-NEG_INCOMING = re.compile(r"\b(appoint(?:ed|ment)|name(?:d|s)|elect(?:ed|ion)|succeed(?:s|ed)|assume(?:s|d) (?:the )?role|will serve as|will act as|promotion|promote(?:d)?)\b", re.IGNORECASE)
-DATE_RE = re.compile(r"(January|February|March|April|May|June|July|August|September|October|November|December) \d{1,2}, \d{4}")
-NAME_RE = re.compile(r"\b([A-Z][a-z]+(?: [A-Z]\.)?(?: [A-Z][a-z]+){0,3})\b")
+NEG_INCOMING = re.compile(r"\b(appoint(?:ed|ment)|name(?:d|s)|elect(?:ed|ion)|succeed(?:s|ed)|assume(?:s|d) (?:the )?role|will serve as|will act as|promotion|promote(?:d)?|appointed as CEO)\b", re.IGNORECASE)
+DATE_RE = re.compile(r"((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+)?(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}|effective immediately|effective as of\s+(?:\w+\s+)?\w+\s+\d{1,2},\s+\d{4}", re.IGNORECASE)
+NAME_RE = re.compile(r"\b((?:Mr\.|Ms\.|Mrs\.|Dr\.)?\s*[A-Z][a-z]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][a-z\-]+){0,3}(?:\s+(?:Jr\.|Sr\.|II|III|IV))?)\b")
 
 @st.cache_data(show_spinner=False)
 def load_ticker_map(ua: str) -> Dict[str, int]:
@@ -292,32 +292,36 @@ def extract_ceo_departures_heuristic(text: str) -> List[Dict[str, str]]:
     sentences = re.split(r"(?<=[\.!?])\s+", text)
     for idx, sent in enumerate(sentences):
         if len(sent) < 20: continue
-        if not CEO_TOKEN.search(sent): continue
-        if NEG_CONTINUE.search(sent): continue  # e.g., "will continue as CEO"
-        if NEG_INCOMING.search(sent): continue  # exclude appointment/incoming mentions
-        if not DEPARTURE_VERBS.search(sent): continue
-        # Capture name near CEO token
-        m = re.search(r"([A-Z][a-z]+(?: [A-Z]\.)?(?: [A-Z][a-z]+){0,3}),?\s+(?:the )?(?:Chief Executive Officer|C\.?.?E\.?.?O\.?.?|CEO|principal executive officer)\b", sent)
+        if not CEO_TOKEN.search(sent):
+            # sometimes the "CEO" token is in the previous sentence
+            prev = sentences[idx-1] if idx > 0 else ""
+            if not prev or not CEO_TOKEN.search(prev):
+                continue
+        if NEG_CONTINUE.search(sent): continue
+        if NEG_INCOMING.search(sent): continue
+        # check verbs in this or previous sentence
+        if not (DEPARTURE_VERBS.search(sent) or (idx > 0 and DEPARTURE_VERBS.search(sentences[idx-1]))):
+            continue
+        # Capture name near CEO token across sentences
+        search_window = " ".join(sentences[max(0, idx-1): min(len(sentences), idx+2)])
+        m = re.search(r"([A-Z][a-z\-]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][a-z\-]+){0,3}(?:\s+(?:Jr\.|Sr\.|II|III|IV))?),?\s+(?:the )?(?:Chief Executive Officer|C\.?.?E\.?.?O\.?.?|CEO|principal executive officer)\b", search_window)
         if not m:
-            m = re.search(r"(?:Chief Executive Officer|C\.?.?E\.?.?O\.?.?|CEO|principal executive officer)\s+([A-Z][a-z]+(?: [A-Z]\.)?(?: [A-Z][a-z]+){0,3})", sent)
+            m = re.search(r"(?:Chief Executive Officer|C\.?.?E\.?.?O\.?.?|CEO|principal executive officer)\s+([A-Z][a-z\-]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][a-z\-]+){0,3}(?:\s+(?:Jr\.|Sr\.|II|III|IV))?)", search_window)
         name = m.group(1) if m else None
         if not name:
-            n = NAME_RE.search(sent); name = n.group(1) if n else None
+            n = NAME_RE.search(search_window); name = n.group(1) if n else None
         if not name: continue
-        # look for effective date in this or adjacent sentences
-        d = DATE_RE.search(sent)
-        if not d:
-            look_window = " ".join(sentences[max(0, idx-1): min(len(sentences), idx+2)])
-            d = DATE_RE.search(look_window)
+        d = DATE_RE.search(search_window)
         evidence = sent.strip()
-        confidence = 0.6
+        confidence = 0.7
         if d: confidence += 0.2
-        if re.search(r"effective|effective immediately|effective on", evidence, re.IGNORECASE):
-            confidence += 0.1
-        if "CEO" in evidence or re.search(r"Chief Executive Officer", evidence, re.IGNORECASE):
+        if re.search(r"effective|effective immediately|effective on|effective as of", search_window, re.IGNORECASE):
             confidence += 0.05
-        ev = {"name": name, "phrase": evidence[:300], "confidence": round(min(confidence, 0.95), 2)}
-        if d: ev["date"] = d.group(0)
+        if CEO_TOKEN.search(search_window) and DEPARTURE_VERBS.search(search_window):
+            confidence += 0.05
+        ev = {"name": name.strip(), "phrase": evidence[:300], "confidence": round(min(confidence, 0.98), 2)}
+        if d:
+            ev["date"] = d.group(0)
         events.append(ev)
     return events
 
@@ -459,14 +463,8 @@ def extract_ceo_departures_gemini(text: str, api_key: str, model_name: str) -> L
             if not raw_text:
                 raw_text = js.get("text", "") or ""
             if not raw_text:
-                if not REST_WARNED:
-                    st.warning("Gemini REST call failed; using heuristic extractor.")
-                    REST_WARNED = True
                 return extract_ceo_departures_heuristic(context)
         except Exception:
-            if not REST_WARNED:
-                st.warning("Gemini REST call failed; using heuristic extractor.")
-                REST_WARNED = True
             return extract_ceo_departures_heuristic(context)
 
     # Parse JSON response (best effort), otherwise fallback to heuristic
