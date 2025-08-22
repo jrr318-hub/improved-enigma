@@ -237,29 +237,68 @@ def extract_ceo_departures_gemini(text: str, api_key: str, model_name: str) -> L
         "Exclude directors and all non-CEO officers. Exclude CEO appointments (incoming). "
         "For each event, include person (name), a short evidence quote (<=240 chars), and effective_date if present."
     )
-
-    model = genai.GenerativeModel(model_name=model_name, system_instruction=system)
-
-    resp = model.generate_content(
-        [
-            {"role": "user", "parts": [
-                "Extract CEO departures only from this 8-K text (Item 5.02):\n\n",
-                context
-            ]}
-        ],
-        generation_config={
-            "temperature": 0.2,
-            "response_mime_type": "application/json",
-            "response_schema": response_schema,
-            "max_output_tokens": 800,
-        },
-    )
-
+    # Compatibility: support environments without GenerativeModel or structured outputs
+    prompt_parts = [
+        {"role": "user", "parts": [
+            "Extract CEO departures only from this 8-K text (Item 5.02):\n\n",
+            context
+        ]}
+    ]
+    raw_text: str = ""
     try:
-        data = json.loads(resp.text)
-    except Exception:
-        # If the model didn't adhere to JSON, fallback
+        model_cls = getattr(genai, "GenerativeModel", None)
+        if model_cls is None:
+            raise AttributeError("GenerativeModel is not available in google-generativeai")
+        model = model_cls(model_name=model_name, system_instruction=system)
+        try:
+            resp = model.generate_content(
+                prompt_parts,
+                generation_config={
+                    "temperature": 0.2,
+                    "response_mime_type": "application/json",
+                    "response_schema": response_schema,
+                    "max_output_tokens": 800,
+                },
+            )
+            raw_text = getattr(resp, "text", "") or ""
+        except Exception:
+            # Fallback without response schema; ask for JSON in plain text
+            resp = model.generate_content(
+                [
+                    {"role": "user", "parts": [
+                        system + "\nReturn a strict JSON object with an 'events' array per the schema. No prose.",
+                        "\n\nExtract CEO departures only from this 8-K text (Item 5.02):\n\n",
+                        context,
+                    ]}
+                ],
+                generation_config={
+                    "temperature": 0.1,
+                    "max_output_tokens": 800,
+                },
+            )
+            raw_text = getattr(resp, "text", "") or ""
+    except AttributeError:
+        st.warning("Your google-generativeai package version is missing GenerativeModel. Upgrade with: pip install -U google-generativeai")
         return extract_ceo_departures_heuristic(context)
+
+    # Parse JSON response (best effort), otherwise fallback to heuristic
+    try:
+        data = json.loads(raw_text)
+    except Exception:
+        # Try to extract a JSON block if the model wrapped it
+        try:
+            fenced = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", raw_text)
+            if fenced:
+                data = json.loads(fenced.group(1))
+            else:
+                # last resort: take substring between first { and last }
+                first = raw_text.find("{"); last = raw_text.rfind("}")
+                if first != -1 and last != -1 and last > first:
+                    data = json.loads(raw_text[first:last+1])
+                else:
+                    return extract_ceo_departures_heuristic(context)
+        except Exception:
+            return extract_ceo_departures_heuristic(context)
 
     events = data.get("events", []) if isinstance(data, dict) else []
 
