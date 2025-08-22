@@ -63,12 +63,13 @@ ARCHIVE_HEADERS = lambda ua: {"User-Agent": ua.strip(), "Accept-Encoding": "gzip
 ITEM_502_REGEX = re.compile(r"item[\s\xa0]*5\.02", re.IGNORECASE)
 TAG_STRIPPER = re.compile(r"<[^>]+>")
 
-CEO_TOKEN = re.compile(r"\b(Chief Executive Officer|C\.?E\.?O\.?|CEO)\b", re.IGNORECASE)
+CEO_TOKEN = re.compile(r"\b(Chief Executive Officer|C\.?.?E\.?.?O\.?.?|CEO|principal executive officer)\b", re.IGNORECASE)
 DEPARTURE_VERBS = re.compile(
-    r"(resign(?:ed)?|retir(?:e|ed)|terminate(?:d)?|ceased to serve|removed|dismissed|separate(?:d)?|stepp?ed down|will not stand for re-election)",
+    r"(resign(?:s|ed|ation)?|retir(?:e|es|ed|ement)|terminate(?:s|d|ion)?|ceased to serve|remov(?:e|ed)|dismiss(?:al|ed)|separate(?:s|d|ion)?|stepp?ed down|step(?:s)? down|will step down|to step down|will not stand for re-election|depart(?:s|ed|ure)?|leave(?:s|ing|t)|transition(?:s|ed)? out|end(?:ed)? employment|employment terminated)",
     re.IGNORECASE,
 )
 NEG_CONTINUE = re.compile(r"\b(continue|remains?|remain|retains?)\b", re.IGNORECASE)
+NEG_INCOMING = re.compile(r"\b(appoint(?:ed|ment)|name(?:d|s)|elect(?:ed|ion)|succeed(?:s|ed)|assume(?:s|d) (?:the )?role|will serve as|will act as|promotion|promote(?:d)?)\b", re.IGNORECASE)
 DATE_RE = re.compile(r"(January|February|March|April|May|June|July|August|September|October|November|December) \d{1,2}, \d{4}")
 NAME_RE = re.compile(r"\b([A-Z][a-z]+(?: [A-Z]\.)?(?: [A-Z][a-z]+){0,3})\b")
 
@@ -142,6 +143,20 @@ def find_item_502(text: str) -> Optional[str]:
     start = max(m.start() - 120, 0); end = min(m.end() + 180, len(text))
     return text[start:end].strip()
 
+
+def extract_item_502_section(text: str) -> Optional[str]:
+    """Return the full Item 5.02 section from cleaned text, up to the next Item section or end."""
+    m = ITEM_502_REGEX.search(text)
+    if not m: return None
+    start = m.start()
+    # Match next item (e.g., Item 5.03, Item 9.01, Item 1.01, etc.). Allow nbsp/space variants
+    next_item_re = re.compile(r"item[\s\xa0]*\d+\.\d+", re.IGNORECASE)
+    next_m = next_item_re.search(text, m.end())
+    end = next_m.start() if next_m else len(text)
+    # Trim overly long sections just in case
+    section = text[start:end]
+    return section.strip()
+
 # --------------------
 # Heuristic fallback (strict)
 # --------------------
@@ -153,11 +168,12 @@ def extract_ceo_departures_heuristic(text: str) -> List[Dict[str, str]]:
         if len(sent) < 20: continue
         if not CEO_TOKEN.search(sent): continue
         if NEG_CONTINUE.search(sent): continue  # e.g., "will continue as CEO"
+        if NEG_INCOMING.search(sent): continue  # exclude appointment/incoming mentions
         if not DEPARTURE_VERBS.search(sent): continue
         # Capture name near CEO token
-        m = re.search(r"([A-Z][a-z]+(?: [A-Z]\.)?(?: [A-Z][a-z]+){0,3}),?\s+(?:the )?(?:Chief Executive Officer|C\.?E\.?O\.?|CEO)\b", sent)
+        m = re.search(r"([A-Z][a-z]+(?: [A-Z]\.)?(?: [A-Z][a-z]+){0,3}),?\s+(?:the )?(?:Chief Executive Officer|C\.?.?E\.?.?O\.?.?|CEO|principal executive officer)\b", sent)
         if not m:
-            m = re.search(r"(?:Chief Executive Officer|C\.?E\.?O\.?|CEO)\s+([A-Z][a-z]+(?: [A-Z]\.)?(?: [A-Z][a-z]+){0,3})", sent)
+            m = re.search(r"(?:Chief Executive Officer|C\.?.?E\.?.?O\.?.?|CEO|principal executive officer)\s+([A-Z][a-z]+(?: [A-Z]\.)?(?: [A-Z][a-z]+){0,3})", sent)
         name = m.group(1) if m else None
         if not name:
             n = NAME_RE.search(sent); name = n.group(1) if n else None
@@ -185,9 +201,13 @@ def extract_ceo_departures_gemini(text: str, api_key: str, model_name: str) -> L
 
     genai.configure(api_key=api_key)
 
+    # Prefer the Item 5.02 section strictly
+    section = extract_item_502_section(text)
+    narrowed = section if section else text
+
     # Focus the context to likely paragraphs to reduce cost and increase accuracy
-    paras = [p for p in re.split(r"\n\s*\n", text) if ("CEO" in p or "Chief Executive Officer" in p or "chief executive officer" in p)]
-    context = "\n\n".join(paras)[:150_000] or text[:120_000]
+    paras = [p for p in re.split(r"\n\s*\n", narrowed) if ("CEO" in p or "Chief Executive Officer" in p or "chief executive officer" in p)]
+    context = "\n\n".join(paras)[:150_000] or narrowed[:120_000]
 
     # Structured outputs via response schema
     response_schema = {
@@ -251,17 +271,21 @@ def extract_ceo_departures_gemini(text: str, api_key: str, model_name: str) -> L
         name = (e.get("person") or "").strip()
         if not name:
             continue
-        pat = re.compile(rf"(.{{0,120}})(?:CEO|Chief Executive Officer)(.{{0,120}}{re.escape(name)}.{{0,120}})", re.IGNORECASE)
+        # reject if the evidence reads like an incoming appointment
+        evidence_text = (e.get("evidence") or "")
+        if NEG_INCOMING.search(evidence_text):
+            continue
+        pat = re.compile(rf"(.{{0,120}})(?:CEO|Chief Executive Officer|principal executive officer)(.{{0,120}}{re.escape(name)}.{{0,120}})", re.IGNORECASE)
         if pat.search(context):
             checked.append({
                 "name": name,
-                "phrase": (e.get("evidence") or "")[:300],
+                "phrase": evidence_text[:300],
                 "date": (e.get("effective_date") or "").strip(),
             })
         else:
             # fallback sentence check
             for sent in re.split(r"(?<=[\.!?])\s+", context):
-                if name in sent and CEO_TOKEN.search(sent) and DEPARTURE_VERBS.search(sent):
+                if name in sent and CEO_TOKEN.search(sent) and DEPARTURE_VERBS.search(sent) and not NEG_INCOMING.search(sent):
                     checked.append({
                         "name": name,
                         "phrase": (e.get("evidence") or sent)[:300],
@@ -298,7 +322,7 @@ def parse_company_inputs(upload: Optional[io.BytesIO], manual_text: str, ua: str
 # Scanning
 # --------------------
 
-def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_gemini: bool, api_key: str, model_name: str) -> List[Dict[str, str]]:
+def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_full_history_flag: bool, use_gemini: bool, api_key: str, model_name: str) -> List[Dict[str, str]]:
     try:
         js = fetch_submissions(cik, ua)
         company = js.get("name", "")
@@ -308,7 +332,14 @@ def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_gemini: b
     s = requests.Session(); s.headers.update(ARCHIVE_HEADERS(ua))
     out: List[Dict[str, str]] = []
 
-    filings = fetch_extended_history(cik, ua)
+    if use_full_history_flag:
+        filings = fetch_extended_history(cik, ua)
+    else:
+        try:
+            js = fetch_submissions(cik, ua)
+            filings = list(iter_filings_from_submissions(js))
+        except Exception:
+            filings = []
     for row in filings:
         if not row.get("form", "").upper().startswith("8-K"): continue
         acc, primary, fdate = row.get("accessionNumber"), row.get("primaryDocument"), row.get("filingDate")
@@ -320,12 +351,13 @@ def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_gemini: b
         try:
             resp = s.get(url, timeout=60); resp.raise_for_status(); resp.encoding = resp.apparent_encoding or "utf-8"
             text = clean_html(resp.text)
-            if not find_item_502(text):
+            section = extract_item_502_section(text)
+            if not section:
                 time.sleep(delay_s); continue
             if use_gemini:
-                events = extract_ceo_departures_gemini(text, api_key, model_name)
+                events = extract_ceo_departures_gemini(section, api_key, model_name)
             else:
-                events = extract_ceo_departures_heuristic(text)
+                events = extract_ceo_departures_heuristic(section)
             if not events:
                 time.sleep(delay_s); continue
             for ev in events:
@@ -377,7 +409,7 @@ if run_btn:
     delay = 1.0 / max(rps, 0.2)
     for i, cik in enumerate(ciks, start=1):
         with st.spinner(f"Scanning CIK {int(cik):010d} for CEO departures"):
-            rows += scan_cik_for_ceo_departures(cik, ua, delay, use_gemini, gemini_key, gemini_model)
+            rows += scan_cik_for_ceo_departures(cik, ua, delay, use_full_history, use_gemini, gemini_key, gemini_model)
         bar.progress(int(i / len(ciks) * 100))
 
     if not rows:
