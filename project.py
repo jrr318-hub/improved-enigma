@@ -655,11 +655,46 @@ if run_btn:
     st.success(f"Processing {len(ciks)} CIK(s)…")
     bar = st.progress(0)
     rows: List[Dict[str, str]] = []
+    # Placeholders for incremental UI
+    results_placeholder = st.empty()
+    log_placeholder = st.empty()
+    log_lines: List[str] = []
+    # Build a CIK->ticker map for nicer progress messages
+    try:
+        _tmap = load_ticker_map(ua)
+        cik_to_ticker = {cik: t for t, cik in _tmap.items()}
+    except Exception:
+        cik_to_ticker = {}
 
     delay = 1.0 / max(rps, 0.2)
     for i, cik in enumerate(ciks, start=1):
+        prev_n = len(rows)
         with st.spinner(f"Scanning CIK {int(cik):010d} for CEO departures"):
-            rows += scan_cik_for_ceo_departures(cik, ua, delay, use_full_history, use_gemini, gemini_key, gemini_model)
+            new_rows = scan_cik_for_ceo_departures(cik, ua, delay, use_full_history, use_gemini, gemini_key, gemini_model)
+            rows += new_rows
+        # Log per-ticker completion
+        label = cik_to_ticker.get(int(cik)) or fetch_company_name(cik, ua) or f"CIK {int(cik):010d}"
+        num_new = len(rows) - prev_n
+        plural = "s" if num_new != 1 else ""
+        log_lines.append(f"{label} finished searching ({num_new} result{plural})")
+        log_placeholder.markdown("\n".join(f"- {m}" for m in log_lines))
+        # Incremental results table
+        if rows:
+            df_live = pd.DataFrame(rows)
+            results_placeholder.dataframe(
+                df_live.sort_values(["filingDate", "company"], ascending=[False, True]),
+                use_container_width=True,
+                height=560,
+                column_config={
+                    "documentUrl": st.column_config.LinkColumn(label="Open 8-K", display_text="Open 8-K"),
+                    "filingDetailUrl": st.column_config.LinkColumn(label="Index", display_text="Index"),
+                    "departing": st.column_config.CheckboxColumn(label="Departing"),
+                    "ceo_name": st.column_config.TextColumn(label="CEO Name"),
+                    "effective_date": st.column_config.TextColumn(label="Effective Date"),
+                    "confidence": st.column_config.NumberColumn(label="Confidence", help="0-1 score", format="%0.2f"),
+                    "context": st.column_config.TextColumn(label="Context (snippet)", width="medium"),
+                }
+            )
         bar.progress(int(i / len(ciks) * 100))
 
     if not rows:
