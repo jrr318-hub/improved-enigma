@@ -1,4 +1,4 @@
-So heres what im working on, im creating an app that live parses the SEC Edgar database and pulls 8-K (specifically item 5.02). The issue im having is once this parses, th egenerative ai (gemini) is not pulling accurate data. I need to pull from the 8-ks where CEOs are leaving/departing. here is my source code that ive built so far: # app.py
+
 """
 8-K CEO Departure Watch (Item 5.02) — Gemini edition
 ----------------------------------------------------
