@@ -60,17 +60,22 @@ run_btn = st.button("🚀 Run search")
 SEC_HEADERS = lambda ua: {"User-Agent": ua.strip(), "Accept-Encoding": "gzip, deflate", "Host": "data.sec.gov"}
 ARCHIVE_HEADERS = lambda ua: {"User-Agent": ua.strip(), "Accept-Encoding": "gzip, deflate", "Host": "www.sec.gov"}
 
+# warn-once flags
+SDK_WARNED = False
+REST_WARNED = False
+
 ITEM_502_REGEX = re.compile(r"item[\s\xa0]*5\.02", re.IGNORECASE)
 TAG_STRIPPER = re.compile(r"<[^>]+>")
 
-CEO_TOKEN = re.compile(r"\b(Chief Executive Officer|C\.?E\.?O\.?|CEO)\b", re.IGNORECASE)
+CEO_TOKEN = re.compile(r"\b(Chief Executive Officer|C\.?.?E\.?.?O\.?.?|CEO|principal executive officer)\b", re.IGNORECASE)
 DEPARTURE_VERBS = re.compile(
-    r"(resign(?:ed)?|retir(?:e|ed)|terminate(?:d)?|ceased to serve|removed|dismissed|separate(?:d)?|stepp?ed down|will not stand for re-election)",
+    r"(resign(?:s|ed|ation)?|retir(?:e|es|ed|ement)|terminate(?:s|d|ion)?|ceased to serve|remov(?:e|ed)|dismiss(?:al|ed)|separate(?:s|d|ion)?|stepp?ed down|step(?:s)? down|will step down|to step down|will not stand for re-election|depart(?:s|ed|ure)?|leave(?:s|ing|t)|transition(?:s|ed)? out|end(?:ed)? employment|employment terminated|will no longer serve as|is no longer (?:the )?CEO)",
     re.IGNORECASE,
 )
 NEG_CONTINUE = re.compile(r"\b(continue|remains?|remain|retains?)\b", re.IGNORECASE)
-DATE_RE = re.compile(r"(January|February|March|April|May|June|July|August|September|October|November|December) \d{1,2}, \d{4}")
-NAME_RE = re.compile(r"\b([A-Z][a-z]+(?: [A-Z]\.)?(?: [A-Z][a-z]+){0,3})\b")
+NEG_INCOMING = re.compile(r"\b(appoint(?:ed|ment)|name(?:d|s)|elect(?:ed|ion)|succeed(?:s|ed)|assume(?:s|d) (?:the )?role|will serve as|will act as|promotion|promote(?:d)?|appointed as CEO)\b", re.IGNORECASE)
+DATE_RE = re.compile(r"((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+)?(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}|effective immediately|effective as of\s+(?:\w+\s+)?\w+\s+\d{1,2},\s+\d{4}", re.IGNORECASE)
+NAME_RE = re.compile(r"\b((?:Mr\.|Ms\.|Mrs\.|Dr\.)?\s*[A-Z][a-z]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][a-z\-]+){0,3}(?:\s+(?:Jr\.|Sr\.|II|III|IV))?)\b")
 
 @st.cache_data(show_spinner=False)
 def load_ticker_map(ua: str) -> Dict[str, int]:
@@ -132,15 +137,151 @@ def filing_doc_url(cik: int, accession: str, primary_doc: str) -> str:
     return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}/{primary_doc}"
 
 
+def filing_index_url(cik: int, accession: str) -> str:
+    return f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}-index.html"
+
+
+def pick_best_primary_doc(session: requests.Session, cik: int, accession: str, default_primary: str) -> str:
+    """Use the filing index page to choose the main 8-K HTML document when possible."""
+    try:
+        idx_url = filing_index_url(cik, accession)
+        r = session.get(idx_url, timeout=60)
+        r.raise_for_status()
+        html = r.text
+        # Rough-parse rows: grab tuples of (href, type)
+        # Match links like <a href="/Archives/edgar/data/CIK/ACC/file.htm"> and nearby Type cell
+        rows = re.findall(r"<tr[\s\S]*?</tr>", html, flags=re.IGNORECASE)
+        candidates: List[tuple] = []
+        for row in rows:
+            # document file
+            mfile = re.search(r"href=\"[^\"]*/(.*?)\"", row, flags=re.IGNORECASE)
+            mtype = re.search(r"<td[^>]*>\s*([A-Za-z0-9\- ]*8\-K[^<]*)\s*</td>", row, flags=re.IGNORECASE)
+            if not mfile:
+                continue
+            fname = mfile.group(1)
+            # find document type column; if not explicitly 8-K, also accept description mentioning 8-K
+            is_html = fname.lower().endswith((".htm", ".html"))
+            score = 0
+            if is_html:
+                score += 1
+            if mtype:
+                score += 2
+            # Avoid exhibits (ex99) unless nothing else
+            if re.search(r"ex-?\d|ex99|exhibit", fname, re.IGNORECASE):
+                score -= 2
+            candidates.append((score, fname))
+        if candidates:
+            candidates.sort(reverse=True)
+            best = candidates[0][1]
+            return best
+        return default_primary
+    except Exception:
+        return default_primary
+
+
+def enumerate_candidate_docs(session: requests.Session, cik: int, accession: str, primary: str) -> List[str]:
+    """Return a prioritized list of candidate document filenames to scan within a filing.
+    Includes HTML, TXT, and PDF documents, de-duplicated and ordered by likelihood.
+    """
+    docnames: List[str] = []
+    seen = set()
+    try:
+        idx_url = filing_index_url(cik, accession)
+        r = session.get(idx_url, timeout=60)
+        r.raise_for_status()
+        html = r.text
+        rows = re.findall(r"<tr[\s\S]*?</tr>", html, flags=re.IGNORECASE)
+        for row in rows:
+            mf = re.search(r"href=\"[^\"]*/(.*?)\"", row, flags=re.IGNORECASE)
+            if not mf: continue
+            fname = mf.group(1)
+            if fname in seen: continue
+            ext = fname.lower().rsplit(".", 1)[-1] if "." in fname else ""
+            if ext in ("htm", "html", "txt", "pdf"):
+                seen.add(fname); docnames.append(fname)
+    except Exception:
+        pass
+    # Ensure primary is included and at front
+    if primary and primary not in seen:
+        docnames.insert(0, primary)
+    # Prioritize: HTML -> TXT -> PDF
+    def priority(n: str) -> int:
+        nlow = n.lower()
+        if nlow.endswith((".htm", ".html")): return 3
+        if nlow.endswith(".txt"): return 2
+        if nlow.endswith(".pdf"): return 1
+        return 0
+    docnames.sort(key=priority, reverse=True)
+    return docnames
+
+
+def get_text_from_document(session: requests.Session, url: str) -> Optional[str]:
+    """Fetch a document and return plain text. Supports HTML/TXT natively and tries PDF if available."""
+    r = session.get(url, timeout=60)
+    r.raise_for_status()
+    content_type = (r.headers.get("Content-Type") or "").lower()
+    r.encoding = r.apparent_encoding or "utf-8"
+    if any(ext in url.lower() for ext in (".htm", ".html")) or "html" in content_type:
+        return clean_html(r.text)
+    if url.lower().endswith(".txt") or "text/plain" in content_type:
+        return re.sub(r"\s+", " ", r.text)
+    if url.lower().endswith(".pdf") or "application/pdf" in content_type:
+        try:
+            # Lazy import to avoid hard dep
+            from pdfminer.high_level import extract_text as pdf_extract_text
+            text = pdf_extract_text(io.BytesIO(r.content))
+            return re.sub(r"\s+", " ", text)
+        except Exception:
+            return None
+    # Unknown type
+    return None
+
+
 def clean_html(text: str) -> str:
     text = TAG_STRIPPER.sub(" ", text); return re.sub(r"\s+", " ", text)
 
 
+# Maintain the legacy short-window finder for quick checks
 def find_item_502(text: str) -> Optional[str]:
     m = ITEM_502_REGEX.search(text)
     if not m: return None
     start = max(m.start() - 120, 0); end = min(m.end() + 180, len(text))
     return text[start:end].strip()
+
+
+def extract_item_502_section(text: str) -> Optional[str]:
+    """Return the full Item 5.02 section from cleaned text, up to the next Item section or end."""
+    m = ITEM_502_REGEX.search(text)
+    if not m: return None
+    start = m.start()
+    # Match next item (e.g., Item 5.03, Item 9.01, Item 1.01, etc.). Allow nbsp/space variants
+    next_item_re = re.compile(r"item[\s\xa0]*\d+\.\d+", re.IGNORECASE)
+    next_m = next_item_re.search(text, m.end())
+    end = next_m.start() if next_m else len(text)
+    # Trim overly long sections just in case
+    section = text[start:end]
+    return section.strip()
+
+
+def extract_all_item_502_sections(text: str) -> List[str]:
+    """Extract all Item 5.02 sections from the filing text."""
+    sections: List[str] = []
+    next_item_re = re.compile(r"item[\s\xa0]*\d+\.\d+", re.IGNORECASE)
+    for m in ITEM_502_REGEX.finditer(text):
+        start = m.start()
+        next_m = next_item_re.search(text, m.end())
+        end = next_m.start() if next_m else len(text)
+        section = text[start:end].strip()
+        if 200 <= len(section) <= 200_000:
+            sections.append(section)
+    # Deduplicate near-duplicates
+    uniq: List[str] = []
+    seen = set()
+    for sct in sections:
+        key = sct[:400]
+        if key in seen: continue
+        seen.add(key); uniq.append(sct)
+    return uniq
 
 # --------------------
 # Heuristic fallback (strict)
@@ -149,22 +290,38 @@ def find_item_502(text: str) -> Optional[str]:
 def extract_ceo_departures_heuristic(text: str) -> List[Dict[str, str]]:
     events: List[Dict[str, str]] = []
     sentences = re.split(r"(?<=[\.!?])\s+", text)
-    for sent in sentences:
+    for idx, sent in enumerate(sentences):
         if len(sent) < 20: continue
-        if not CEO_TOKEN.search(sent): continue
-        if NEG_CONTINUE.search(sent): continue  # e.g., "will continue as CEO"
-        if not DEPARTURE_VERBS.search(sent): continue
-        # Capture name near CEO token
-        m = re.search(r"([A-Z][a-z]+(?: [A-Z]\.)?(?: [A-Z][a-z]+){0,3}),?\s+(?:the )?(?:Chief Executive Officer|C\.?E\.?O\.?|CEO)\b", sent)
+        if not CEO_TOKEN.search(sent):
+            # sometimes the "CEO" token is in the previous sentence
+            prev = sentences[idx-1] if idx > 0 else ""
+            if not prev or not CEO_TOKEN.search(prev):
+                continue
+        if NEG_CONTINUE.search(sent): continue
+        if NEG_INCOMING.search(sent): continue
+        # check verbs in this or previous sentence
+        if not (DEPARTURE_VERBS.search(sent) or (idx > 0 and DEPARTURE_VERBS.search(sentences[idx-1]))):
+            continue
+        # Capture name near CEO token across sentences
+        search_window = " ".join(sentences[max(0, idx-1): min(len(sentences), idx+2)])
+        m = re.search(r"([A-Z][a-z\-]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][a-z\-]+){0,3}(?:\s+(?:Jr\.|Sr\.|II|III|IV))?),?\s+(?:the )?(?:Chief Executive Officer|C\.?.?E\.?.?O\.?.?|CEO|principal executive officer)\b", search_window)
         if not m:
-            m = re.search(r"(?:Chief Executive Officer|C\.?E\.?O\.?|CEO)\s+([A-Z][a-z]+(?: [A-Z]\.)?(?: [A-Z][a-z]+){0,3})", sent)
+            m = re.search(r"(?:Chief Executive Officer|C\.?.?E\.?.?O\.?.?|CEO|principal executive officer)\s+([A-Z][a-z\-]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][a-z\-]+){0,3}(?:\s+(?:Jr\.|Sr\.|II|III|IV))?)", search_window)
         name = m.group(1) if m else None
         if not name:
-            n = NAME_RE.search(sent); name = n.group(1) if n else None
+            n = NAME_RE.search(search_window); name = n.group(1) if n else None
         if not name: continue
-        d = DATE_RE.search(sent)
-        ev = {"name": name, "phrase": sent.strip()[:300]}
-        if d: ev["date"] = d.group(0)
+        d = DATE_RE.search(search_window)
+        evidence = sent.strip()
+        confidence = 0.7
+        if d: confidence += 0.2
+        if re.search(r"effective|effective immediately|effective on|effective as of", search_window, re.IGNORECASE):
+            confidence += 0.05
+        if CEO_TOKEN.search(search_window) and DEPARTURE_VERBS.search(search_window):
+            confidence += 0.05
+        ev = {"name": name.strip(), "phrase": evidence[:300], "confidence": round(min(confidence, 0.98), 2)}
+        if d:
+            ev["date"] = d.group(0)
         events.append(ev)
     return events
 
@@ -173,21 +330,30 @@ def extract_ceo_departures_heuristic(text: str) -> List[Dict[str, str]]:
 # --------------------
 
 def extract_ceo_departures_gemini(text: str, api_key: str, model_name: str) -> List[Dict[str, str]]:
+    global SDK_WARNED, REST_WARNED
     try:
         import google.generativeai as genai
     except Exception:
-        st.warning("`google-generativeai` not installed. Falling back to heuristic.")
+        if not SDK_WARNED:
+            st.warning("`google-generativeai` not installed. Falling back to heuristic.")
+            SDK_WARNED = True
         return extract_ceo_departures_heuristic(text)
 
     if not api_key:
-        st.warning("No Gemini API key provided — using heuristic only.")
+        if not SDK_WARNED:
+            st.warning("No Gemini API key provided — using heuristic only.")
+            SDK_WARNED = True
         return extract_ceo_departures_heuristic(text)
 
     genai.configure(api_key=api_key)
 
+    # Prefer all Item 5.02 sections
+    sections = extract_all_item_502_sections(text)
+    narrowed = "\n\n---\n\n".join(sections) if sections else text
+
     # Focus the context to likely paragraphs to reduce cost and increase accuracy
-    paras = [p for p in re.split(r"\n\s*\n", text) if ("CEO" in p or "Chief Executive Officer" in p or "chief executive officer" in p)]
-    context = "\n\n".join(paras)[:150_000] or text[:120_000]
+    paras = [p for p in re.split(r"\n\s*\n", narrowed) if ("CEO" in p or "Chief Executive Officer" in p or "chief executive officer" in p)]
+    context = "\n\n".join(paras)[:150_000] or narrowed[:120_000]
 
     # Structured outputs via response schema
     response_schema = {
@@ -217,29 +383,106 @@ def extract_ceo_departures_gemini(text: str, api_key: str, model_name: str) -> L
         "Exclude directors and all non-CEO officers. Exclude CEO appointments (incoming). "
         "For each event, include person (name), a short evidence quote (<=240 chars), and effective_date if present."
     )
-
-    model = genai.GenerativeModel(model_name=model_name, system_instruction=system)
-
-    resp = model.generate_content(
-        [
-            {"role": "user", "parts": [
-                "Extract CEO departures only from this 8-K text (Item 5.02):\n\n",
-                context
-            ]}
-        ],
-        generation_config={
-            "temperature": 0.2,
-            "response_mime_type": "application/json",
-            "response_schema": response_schema,
-            "max_output_tokens": 800,
-        },
-    )
-
+    # Compatibility: support environments without GenerativeModel or structured outputs
+    prompt_parts = [
+        {"role": "user", "parts": [
+            "Return JSON only with an 'events' array. \n\nExtract CEO departures only from this 8-K (Item 5.02):\n\n",
+            context
+        ]}
+    ]
+    raw_text: str = ""
     try:
-        data = json.loads(resp.text)
+        model_cls = getattr(genai, "GenerativeModel", None)
+        if model_cls is None:
+            raise AttributeError("GenerativeModel is not available in google-generativeai")
+        model = model_cls(model_name=model_name, system_instruction=system)
+        try:
+            resp = model.generate_content(
+                prompt_parts,
+                generation_config={
+                    "temperature": 0.2,
+                    "response_mime_type": "application/json",
+                    "response_schema": response_schema,
+                    "max_output_tokens": 800,
+                },
+            )
+            raw_text = getattr(resp, "text", "") or ""
+        except Exception:
+            # Fallback without response schema; ask for JSON in plain text
+            resp = model.generate_content(
+                [
+                    {"role": "user", "parts": [
+                        system + "\nReturn a strict JSON object with an 'events' array per the schema. No prose.",
+                        "\n\nExtract CEO departures only from this 8-K text (Item 5.02):\n\n",
+                        context,
+                    ]}
+                ],
+                generation_config={
+                    "temperature": 0.1,
+                    "max_output_tokens": 800,
+                },
+            )
+            raw_text = getattr(resp, "text", "") or ""
+    except AttributeError:
+        # REST fallback to Generative Language API
+        try:
+            endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+            payload = {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"text": system},
+                            {"text": "\nReturn a strict JSON object with an 'events' array. No prose."},
+                            {"text": "\n\nExtract CEO departures only from this 8-K text (Item 5.02):\n\n" + context},
+                        ],
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "maxOutputTokens": 800,
+                },
+            }
+            r = requests.post(
+                endpoint,
+                params={"key": api_key},
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(payload),
+                timeout=60,
+            )
+            r.raise_for_status()
+            js = r.json()
+            candidates = js.get("candidates", []) or []
+            for c in candidates:
+                content = c.get("content") or {}
+                parts = content.get("parts") or []
+                texts = [p.get("text", "") for p in parts if isinstance(p, dict)]
+                if texts:
+                    raw_text = "\n".join(texts)
+                    break
+            if not raw_text:
+                raw_text = js.get("text", "") or ""
+            if not raw_text:
+                return extract_ceo_departures_heuristic(context)
+        except Exception:
+            return extract_ceo_departures_heuristic(context)
+
+    # Parse JSON response (best effort), otherwise fallback to heuristic
+    try:
+        data = json.loads(raw_text)
     except Exception:
-        # If the model didn't adhere to JSON, fallback
-        return extract_ceo_departures_heuristic(context)
+        try:
+            fenced = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", raw_text)
+            if fenced:
+                data = json.loads(fenced.group(1))
+            else:
+                first = raw_text.find("{"); last = raw_text.rfind("}")
+                if first != -1 and last != -1 and last > first:
+                    data = json.loads(raw_text[first:last+1])
+                else:
+                    return extract_ceo_departures_heuristic(context)
+        except Exception:
+            return extract_ceo_departures_heuristic(context)
 
     events = data.get("events", []) if isinstance(data, dict) else []
 
@@ -251,21 +494,31 @@ def extract_ceo_departures_gemini(text: str, api_key: str, model_name: str) -> L
         name = (e.get("person") or "").strip()
         if not name:
             continue
-        pat = re.compile(rf"(.{{0,120}})(?:CEO|Chief Executive Officer)(.{{0,120}}{re.escape(name)}.{{0,120}})", re.IGNORECASE)
+        evidence_text = (e.get("evidence") or "")
+        if NEG_INCOMING.search(evidence_text):
+            continue
+        pat = re.compile(rf"(.{{0,160}})(?:CEO|Chief Executive Officer|principal executive officer)(.{{0,160}}{re.escape(name)}.{{0,160}})", re.IGNORECASE)
         if pat.search(context):
+            confidence = 0.7
+            if e.get("effective_date"): confidence += 0.2
+            if re.search(r"effective|effective immediately|effective on", evidence_text, re.IGNORECASE): confidence += 0.05
             checked.append({
                 "name": name,
-                "phrase": (e.get("evidence") or "")[:300],
+                "phrase": evidence_text[:300],
                 "date": (e.get("effective_date") or "").strip(),
+                "confidence": round(min(confidence, 0.98), 2),
             })
         else:
-            # fallback sentence check
             for sent in re.split(r"(?<=[\.!?])\s+", context):
-                if name in sent and CEO_TOKEN.search(sent) and DEPARTURE_VERBS.search(sent):
+                if name in sent and CEO_TOKEN.search(sent) and DEPARTURE_VERBS.search(sent) and not NEG_INCOMING.search(sent):
+                    confidence = 0.65
+                    if e.get("effective_date"): confidence += 0.2
+                    if re.search(r"effective|effective immediately|effective on", sent, re.IGNORECASE): confidence += 0.05
                     checked.append({
                         "name": name,
                         "phrase": (e.get("evidence") or sent)[:300],
                         "date": (e.get("effective_date") or "").strip(),
+                        "confidence": round(min(confidence, 0.95), 2),
                     })
                     break
     return checked
@@ -298,7 +551,7 @@ def parse_company_inputs(upload: Optional[io.BytesIO], manual_text: str, ua: str
 # Scanning
 # --------------------
 
-def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_gemini: bool, api_key: str, model_name: str) -> List[Dict[str, str]]:
+def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_full_history_flag: bool, use_gemini: bool, api_key: str, model_name: str) -> (List[Dict[str, str]], List[str]):
     try:
         js = fetch_submissions(cik, ua)
         company = js.get("name", "")
@@ -307,8 +560,16 @@ def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_gemini: b
 
     s = requests.Session(); s.headers.update(ARCHIVE_HEADERS(ua))
     out: List[Dict[str, str]] = []
+    found_502_docs: List[str] = []
 
-    filings = fetch_extended_history(cik, ua)
+    if use_full_history_flag:
+        filings = fetch_extended_history(cik, ua)
+    else:
+        try:
+            js = fetch_submissions(cik, ua)
+            filings = list(iter_filings_from_submissions(js))
+        except Exception:
+            filings = []
     for row in filings:
         if not row.get("form", "").upper().startswith("8-K"): continue
         acc, primary, fdate = row.get("accessionNumber"), row.get("primaryDocument"), row.get("filingDate")
@@ -316,16 +577,35 @@ def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_gemini: b
         if start_date and fdate and fdate < start_date.strftime("%Y-%m-%d"): continue
         if end_date and fdate and fdate > end_date.strftime("%Y-%m-%d"): continue
 
-        url = filing_doc_url(cik, acc, primary)
+        # Use filing index to pick the main document when possible
+        chosen_doc = pick_best_primary_doc(s, cik, acc, primary)
+        url = filing_doc_url(cik, acc, chosen_doc)
         try:
-            resp = s.get(url, timeout=60); resp.raise_for_status(); resp.encoding = resp.apparent_encoding or "utf-8"
-            text = clean_html(resp.text)
-            if not find_item_502(text):
+            # Enumerate all candidate documents in this filing and scan each
+            docs = enumerate_candidate_docs(s, cik, acc, chosen_doc)
+            sections_all: List[str] = []
+            first_event_doc_url: Optional[str] = None
+            for fname in docs:
+                doc_url = filing_doc_url(cik, acc, fname)
+                try:
+                    text = get_text_from_document(s, doc_url)
+                except Exception:
+                    text = None
+                if not text:
+                    continue
+                sections = extract_all_item_502_sections(text)
+                if sections:
+                    sections_all.extend(sections)
+                    found_502_docs.append(doc_url)
+                    if first_event_doc_url is None:
+                        first_event_doc_url = doc_url
+            if not sections_all:
                 time.sleep(delay_s); continue
+            joined = "\n\n---\n\n".join(sections_all)
             if use_gemini:
-                events = extract_ceo_departures_gemini(text, api_key, model_name)
+                events = extract_ceo_departures_gemini(joined, api_key, model_name)
             else:
-                events = extract_ceo_departures_heuristic(text)
+                events = extract_ceo_departures_heuristic(joined)
             if not events:
                 time.sleep(delay_s); continue
             for ev in events:
@@ -335,11 +615,12 @@ def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_gemini: b
                     "filingDate": fdate,
                     "accessionNumber": acc,
                     "ceo_name": ev.get("name", ""),
-                    "departing": True,  # departures only
+                    "departing": True,
                     "context": ev.get("phrase", ""),
                     "effective_date": ev.get("date", ""),
-                    "documentUrl": url,
-                    "filingDetailUrl": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc.replace('-', '')}-index.html",
+                    "confidence": ev.get("confidence", 0.6),
+                    "documentUrl": first_event_doc_url or url,
+                    "filingDetailUrl": filing_index_url(cik, acc),
                 })
         except Exception as e:
             out.append({
@@ -351,11 +632,12 @@ def scan_cik_for_ceo_departures(cik: int, ua: str, delay_s: float, use_gemini: b
                 "departing": False,
                 "context": f"ERROR: {e}",
                 "effective_date": "",
+                "confidence": 0.0,
                 "documentUrl": url,
-                "filingDetailUrl": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{(acc or '').replace('-', '')}-index.html",
+                "filingDetailUrl": filing_index_url(cik, acc),
             })
         time.sleep(delay_s)
-    return out
+    return out, sorted(list(set(found_502_docs)))
 
 # --------------------
 # Run
@@ -373,16 +655,56 @@ if run_btn:
     st.success(f"Processing {len(ciks)} CIK(s)…")
     bar = st.progress(0)
     rows: List[Dict[str, str]] = []
+    # Placeholders for incremental UI
+    results_placeholder = st.empty()
+    log_placeholder = st.empty()
+    log_lines: List[str] = []
+    # Build a CIK->ticker map for nicer progress messages
+    try:
+        _tmap = load_ticker_map(ua)
+        cik_to_ticker = {cik: t for t, cik in _tmap.items()}
+    except Exception:
+        cik_to_ticker = {}
 
     delay = 1.0 / max(rps, 0.2)
+    cik_to_docs: Dict[int, set] = {}
     for i, cik in enumerate(ciks, start=1):
+        prev_n = len(rows)
         with st.spinner(f"Scanning CIK {int(cik):010d} for CEO departures"):
-            rows += scan_cik_for_ceo_departures(cik, ua, delay, use_gemini, gemini_key, gemini_model)
+            new_rows, doc_urls = scan_cik_for_ceo_departures(cik, ua, delay, use_full_history, use_gemini, gemini_key, gemini_model)
+            rows += new_rows
+            if doc_urls:
+                cik_to_docs.setdefault(int(cik), set()).update(doc_urls)
+        # Log per-ticker completion
+        label = cik_to_ticker.get(int(cik)) or fetch_company_name(cik, ua) or f"CIK {int(cik):010d}"
+        num_new = len(rows) - prev_n
+        plural = "s" if num_new != 1 else ""
+        log_lines.append(f"{label} finished searching ({num_new} result{plural})")
+        log_placeholder.markdown("\n".join(f"- {m}" for m in log_lines))
+        # Incremental results table
+        if rows:
+            df_live = pd.DataFrame(rows)
+            results_placeholder.dataframe(
+                df_live.sort_values(["filingDate", "company"], ascending=[False, True]),
+                use_container_width=True,
+                height=560,
+                column_config={
+                    "documentUrl": st.column_config.LinkColumn(label="Open 8-K", display_text="Open 8-K"),
+                    "filingDetailUrl": st.column_config.LinkColumn(label="Index", display_text="Index"),
+                    "departing": st.column_config.CheckboxColumn(label="Departing"),
+                    "ceo_name": st.column_config.TextColumn(label="CEO Name"),
+                    "effective_date": st.column_config.TextColumn(label="Effective Date"),
+                    "confidence": st.column_config.NumberColumn(label="Confidence", help="0-1 score", format="%0.2f"),
+                    "context": st.column_config.TextColumn(label="Context (snippet)", width="medium"),
+                }
+            )
         bar.progress(int(i / len(ciks) * 100))
 
     if not rows:
         st.warning("No CEO departures detected in Item 5.02 for the selected companies/date range.")
-        st.stop()
+        # still show summary of Item 5.02 links if any
+        if not cik_to_docs:
+            st.stop()
 
     df = pd.DataFrame(rows)
 
@@ -397,11 +719,49 @@ if run_btn:
             "departing": st.column_config.CheckboxColumn(label="Departing"),
             "ceo_name": st.column_config.TextColumn(label="CEO Name"),
             "effective_date": st.column_config.TextColumn(label="Effective Date"),
+            "confidence": st.column_config.NumberColumn(label="Confidence", help="0-1 score", format="%0.2f"),
             "context": st.column_config.TextColumn(label="Context (snippet)", width="medium"),
         }
     )
 
-    csv = df[["company","cik","filingDate","ceo_name","effective_date","documentUrl","filingDetailUrl"]].to_csv(index=False).encode("utf-8")
+    csv = df[["company","cik","filingDate","ceo_name","effective_date","confidence","documentUrl","filingDetailUrl"]].to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Download CSV", data=csv, file_name="ceo_departures_item_5_02.csv", mime="text/csv")
 
-    st.info("Only CEO departures are shown. Director-only changes and other officers are intentionally excluded. If no API key is set, a strict heuristic is used.")
+    # Build company summary with all Item 5.02 links
+    st.markdown("### 3) Summary by company (all Item 5.02 links)")
+    summary_rows: List[Dict[str, str]] = []
+    for cik in ciks:
+        c = int(cik)
+        ticker = cik_to_ticker.get(c, "")
+        # derive company from first matching row or fetch
+        comp = next((r["company"] for r in rows if int(r["cik"]) == c), fetch_company_name(c, ua))
+        # departure and names
+        has_departure = any((int(r["cik"]) == c and r.get("departing")) for r in rows)
+        names = sorted(set(r.get("ceo_name", "") for r in rows if int(r["cik"]) == c and r.get("departing") and r.get("ceo_name")))
+        links = sorted(list(cik_to_docs.get(c, set())))
+        summary_rows.append({
+            "ticker": ticker,
+            "company": comp,
+            "ceo_departure": "Yes" if has_departure else "No",
+            "ceo_name": ", ".join(names),
+            "num_item_5_02_docs": str(len(links)),
+            "item_5_02_links": " | ".join(links),
+        })
+    if summary_rows:
+        df_sum = pd.DataFrame(summary_rows)
+        st.dataframe(
+            df_sum.sort_values(["ticker"], na_position="last"),
+            use_container_width=True,
+            height=400,
+            column_config={
+                "ticker": st.column_config.TextColumn(label="Ticker"),
+                "company": st.column_config.TextColumn(label="Company"),
+                "ceo_departure": st.column_config.TextColumn(label="CEO Departure"),
+                "ceo_name": st.column_config.TextColumn(label="CEO Leaving"),
+                "num_item_5_02_docs": st.column_config.NumberColumn(label="# Item 5.02 Docs"),
+                "item_5_02_links": st.column_config.TextColumn(label="Item 5.02 Links"),
+            }
+        )
+        sum_csv = df_sum.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download Summary CSV", data=sum_csv, file_name="item_5_02_summary.csv", mime="text/csv")
+    st.info("Summary shows all Item 5.02 document links per company for the selected dates.")
